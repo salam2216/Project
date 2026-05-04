@@ -11,15 +11,18 @@ import hashlib
 import zipfile
 import tarfile
 import importlib
-from datetime import datetime
+from datetime import datetime, UTC
 from typing import Optional, List, Union, Any
 from io import BytesIO
 
 import joblib
 import requests
-from fastapi import FastAPI, UploadFile, File, HTTPException, Body
+from fastapi import FastAPI, UploadFile, File, HTTPException, Body, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+
+from auth import router as auth_router, connect_db, disconnect_db, set_db, get_optional_current_user
+import auth as auth_module
 
 # Try to import optional dependencies
 try:
@@ -67,6 +70,19 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ─── MongoDB Startup/Shutdown ─────────────────────────────────────────────────
+@app.on_event("startup")
+async def startup():
+    await connect_db()
+    set_db(auth_module.db)
+
+@app.on_event("shutdown")
+async def shutdown():
+    await disconnect_db()
+
+# ─── Include Auth Router ──────────────────────────────────────────────────────
+app.include_router(auth_router)
+
 # ─── ML Model Load ───────────────────────────────────────────────────────────
 try:
     model = joblib.load('scala_guard_model.pkl')
@@ -75,8 +91,8 @@ except Exception:
     MODEL_LOADED = False
     print("[WARNING] ML model not found. Using simulated scoring.")
 
-# ─── In-Memory Scan History ───────────────────────────────────────────────────
-scan_history: List[dict] = []
+# ─── Scan History Storage ────────────────────────────────────────────────────
+scan_history: List[dict] = []  # legacy fallback/cache; source of truth is MongoDB
 
 # ─── Pydantic Models ─────────────────────────────────────────────────────────
 class PackageScanRequest(BaseModel):
@@ -1223,7 +1239,7 @@ def predict_from_feature_values(numeric_values: List[float]) -> dict:
         "dropped_extra_values": dropped_values,
         "input_used": used_values,
         "model_loaded": MODEL_LOADED,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
     }
 
 # ─── File Processing Helpers ─────────────────────────────────────────────────
@@ -1763,18 +1779,15 @@ Respond in this exact JSON format:
         "cve_references": [c["id"] for c in cves] if cves else [],
     }
 
-def find_scan_by_id(scan_id: str) -> Optional[dict]:
-    for scan in scan_history:
-        if scan.get("scan_id") == scan_id:
-            return scan
-    return None
+async def find_scan_by_id(scan_id: str) -> Optional[dict]:
+    return await fetch_scan_by_id(scan_id)
 
 def build_scan_result(scan_id: str, pkg_name: str, ecosystem: str, sandbox: dict, risk: dict, extra: Optional[dict] = None) -> dict:
     result = {
         "scan_id": scan_id,
         "package_name": pkg_name,
         "ecosystem": ecosystem,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "sandbox": sandbox,
         "risk": risk,
         "remediation": get_ai_remediation(pkg_name, risk, sandbox) if risk["score"] >= 35 else None,
@@ -1782,6 +1795,125 @@ def build_scan_result(scan_id: str, pkg_name: str, ecosystem: str, sandbox: dict
     if extra:
         result.update(extra)
     return result
+
+
+def get_scan_collection():
+    if auth_module.db is None:
+        raise HTTPException(503, "Database not ready")
+    return auth_module.db["scan_history"]
+
+
+def normalize_scan_document(scan: dict) -> dict:
+    doc = dict(scan)
+
+    if "risk" not in doc and ("label" in doc or "risk_score" in doc):
+        doc["risk"] = {
+            "label": doc.get("label", "BENIGN"),
+            "score": doc.get("risk_score", 0),
+            "confidence_band": doc.get("confidence_band"),
+            "shap_factors": doc.get("shap_factors", []),
+        }
+
+    if "scan_type" not in doc:
+        if "summary" in doc and "results" in doc and "filename" in doc:
+            doc["scan_type"] = "batch_audit"
+        elif "prediction" in doc:
+            doc["scan_type"] = "prediction"
+        elif "risk" in doc:
+            doc["scan_type"] = "scan"
+
+    if "createdAt" not in doc:
+        doc["createdAt"] = datetime.now(UTC)
+    if "updatedAt" not in doc:
+        doc["updatedAt"] = datetime.now(UTC)
+
+    return doc
+
+
+def serialize_scan_document(scan: dict) -> dict:
+    doc = dict(scan)
+    if "_id" in doc:
+        doc["_id"] = str(doc["_id"])
+    for field in ("createdAt", "updatedAt"):
+        value = doc.get(field)
+        if isinstance(value, datetime):
+            doc[field] = value.isoformat()
+    return doc
+
+
+async def save_scan_record(scan: dict) -> dict:
+    doc = normalize_scan_document(scan)
+    await get_scan_collection().insert_one(doc)
+    return doc
+
+
+def attach_scan_owner(scan: dict, current_user: Optional[dict]) -> dict:
+    if not current_user:
+        return scan
+
+    owned_scan = dict(scan)
+    owned_scan["userId"] = current_user.get("id")
+    owned_scan["userEmail"] = current_user.get("email")
+    owned_scan["userRole"] = current_user.get("role")
+    return owned_scan
+
+
+async def fetch_recent_scans(limit: int, user_id: Optional[str] = None) -> List[dict]:
+    query = {"userId": user_id} if user_id else {}
+    cursor = get_scan_collection().find(query).sort("createdAt", -1).limit(limit)
+    scans: List[dict] = []
+    async for scan in cursor:
+        scans.append(serialize_scan_document(scan))
+    return scans
+
+
+async def fetch_scan_by_id(scan_id: str, user_id: Optional[str] = None) -> Optional[dict]:
+    query = {"scan_id": scan_id}
+    if user_id:
+        query["userId"] = user_id
+    scan = await get_scan_collection().find_one(query)
+    return serialize_scan_document(scan) if scan else None
+
+
+async def delete_scan_by_id(scan_id: str, user_id: Optional[str] = None) -> bool:
+    query = {"scan_id": scan_id}
+    if user_id:
+        query["userId"] = user_id
+    result = await get_scan_collection().delete_one(query)
+    return result.deleted_count > 0
+
+
+async def clear_scan_history(user_id: Optional[str] = None) -> int:
+    query = {"userId": user_id} if user_id else {}
+    result = await get_scan_collection().delete_many(query)
+    return result.deleted_count
+
+
+async def compute_scan_stats(user_id: Optional[str] = None) -> dict:
+    query = {"userId": user_id} if user_id else {}
+    total = await get_scan_collection().count_documents(query)
+    labels = {"MALICIOUS": 0, "SUSPICIOUS": 0, "BENIGN": 0}
+
+    pipeline = []
+    if query:
+        pipeline.append({"$match": query})
+    pipeline.append({"$group": {"_id": "$risk.label", "count": {"$sum": 1}}})
+    async for row in get_scan_collection().aggregate(pipeline):
+        label = row.get("_id")
+        if label in labels:
+            labels[label] = row.get("count", 0)
+
+    malicious = labels["MALICIOUS"]
+    suspicious = labels["SUSPICIOUS"]
+    benign = labels["BENIGN"]
+
+    return {
+        "total_scans": total,
+        "malicious_found": malicious,
+        "suspicious_found": suspicious,
+        "benign": benign if benign else max(total - malicious - suspicious, 0),
+        "threat_rate": round((malicious / total * 100) if total > 0 else 0, 1),
+    }
 
 
 def analyze_package_for_batch(pkg: str, ecosystem: str) -> dict:
@@ -1820,7 +1952,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"status": "ok", "model_loaded": MODEL_LOADED, "timestamp": datetime.utcnow().isoformat()}
+    return {"status": "ok", "model_loaded": MODEL_LOADED, "timestamp": datetime.now(UTC).isoformat()}
 
 
 @app.get("/api/features")
@@ -1836,7 +1968,10 @@ def get_features():
 
 
 @app.post("/api/predict")
-def predict_numeric(payload: Union[List[float], dict] = Body(...)):
+async def predict_numeric(
+    payload: Union[List[float], dict] = Body(...),
+    current_user: Optional[dict] = Depends(get_optional_current_user),
+):
     """Predict from numeric features.
 
     Accepts either:
@@ -1874,6 +2009,23 @@ def predict_numeric(payload: Union[List[float], dict] = Body(...)):
         if not predictions:
             raise HTTPException(400, "No valid rows to predict")
 
+        batch_result = {
+            "scan_id": f"pred-batch-{int(time.time())}",
+            "scan_type": "prediction_batch",
+            "timestamp": datetime.now(UTC).isoformat(),
+            "mode": "batch",
+            "total_predicted": len(predictions),
+            "total_errors": len(errors),
+            "errors": errors,
+            "predictions": predictions,
+            "risk": {
+                "label": "MALICIOUS" if any(p.get("label") == "MALICIOUS" for p in predictions) else ("SUSPICIOUS" if any(p.get("label") == "SUSPICIOUS" for p in predictions) else "BENIGN"),
+                "score": max((p.get("risk_score", 0) for p in predictions), default=0),
+            },
+        }
+
+        await save_scan_record(attach_scan_owner(batch_result, current_user))
+
         return {
             "mode": "batch",
             "total_predicted": len(predictions),
@@ -1883,11 +2035,28 @@ def predict_numeric(payload: Union[List[float], dict] = Body(...)):
         }
 
     numeric_values = _normalize_row_to_numeric(data)
-    return predict_from_feature_values(numeric_values)
+    result = predict_from_feature_values(numeric_values)
+    await save_scan_record(attach_scan_owner({
+        "scan_id": f"pred-{int(time.time())}-{hashlib.md5(json.dumps(numeric_values).encode()).hexdigest()[:8]}",
+        "scan_type": "prediction",
+        "timestamp": result.get("timestamp", datetime.now(UTC).isoformat()),
+        "package_name": "numeric-input",
+        "ecosystem": "numeric",
+        "input": {"numeric_values": numeric_values},
+        "risk": {
+            "label": result["label"],
+            "score": result["risk_score"],
+        },
+        "prediction": result,
+    }, current_user))
+    return result
 
 
 @app.post("/api/predict/csv")
-async def predict_from_csv(file: UploadFile = File(...)):
+async def predict_from_csv(
+    file: UploadFile = File(...),
+    current_user: Optional[dict] = Depends(get_optional_current_user),
+):
     """Upload a local CSV file and run row-wise numeric predictions."""
     filename = (file.filename or "").strip()
     if not filename.lower().endswith(".csv"):
@@ -1932,7 +2101,7 @@ async def predict_from_csv(file: UploadFile = File(...)):
     if not predictions:
         raise HTTPException(400, "No valid numeric rows found in CSV")
 
-    return {
+    response = {
         "filename": filename,
         "total_predicted": len(predictions),
         "total_skipped": len(skipped_rows),
@@ -1940,8 +2109,31 @@ async def predict_from_csv(file: UploadFile = File(...)):
         "predictions": predictions,
     }
 
+    await save_scan_record(attach_scan_owner({
+        "scan_id": f"pred-csv-{int(time.time())}-{hashlib.md5(filename.encode()).hexdigest()[:8]}",
+        "scan_type": "prediction_csv",
+        "timestamp": datetime.now(UTC).isoformat(),
+        "package_name": filename,
+        "ecosystem": "numeric",
+        "input": {"filename": filename},
+        "summary": {
+            "total_predicted": len(predictions),
+            "total_skipped": len(skipped_rows),
+        },
+        "predictions": predictions,
+        "risk": {
+            "label": "MALICIOUS" if any(p.get("label") == "MALICIOUS" for p in predictions) else ("SUSPICIOUS" if any(p.get("label") == "SUSPICIOUS" for p in predictions) else "BENIGN"),
+            "score": max((p.get("risk_score", 0) for p in predictions), default=0),
+        },
+    }, current_user))
+
+    return response
+
 @app.post("/analyze")
-async def analyze_file(package_file: UploadFile = File(...)):
+async def analyze_file(
+    package_file: UploadFile = File(...),
+    current_user: Optional[dict] = Depends(get_optional_current_user),
+):
     """Analyze an uploaded package file or dependency file."""
     
     allowed_exts = {
@@ -2051,7 +2243,7 @@ async def analyze_file(package_file: UploadFile = File(...)):
         }
     )
     
-    scan_history.append(result)
+    await save_scan_record(attach_scan_owner(result, current_user))
     
     # Clean up temp file
     try:
@@ -2062,7 +2254,10 @@ async def analyze_file(package_file: UploadFile = File(...)):
     return result
 
 @app.post("/analyze/name")
-async def analyze_by_name(req: PackageScanRequest):
+async def analyze_by_name(
+    req: PackageScanRequest,
+    current_user: Optional[dict] = Depends(get_optional_current_user),
+):
     """Analyze a package by name from NPM or PyPI registry."""
     
     pkg_name = req.name.strip().lower()
@@ -2115,11 +2310,14 @@ async def analyze_by_name(req: PackageScanRequest):
         }
     )
     
-    scan_history.append(result)
+    await save_scan_record(attach_scan_owner(result, current_user))
     return result
 
 @app.post("/analyze/text")
-async def analyze_text(req: TextScanRequest):
+async def analyze_text(
+    req: TextScanRequest,
+    current_user: Optional[dict] = Depends(get_optional_current_user),
+):
     """Analyze free text such as logs, incident notes, or package snippets."""
     
     payload = req.text.strip()
@@ -2209,11 +2407,15 @@ async def analyze_text(req: TextScanRequest):
         }
     )
     
-    scan_history.append(result)
+    await save_scan_record(attach_scan_owner(result, current_user))
     return result
 
 @app.post("/analyze/batch")
-async def analyze_batch_file(package_file: UploadFile = File(...), ecosystem: str = "pypi"):
+async def analyze_batch_file(
+    package_file: UploadFile = File(...),
+    ecosystem: str = "pypi",
+    current_user: Optional[dict] = Depends(get_optional_current_user),
+):
     """Scan entire requirements.txt, package.json, CSV, Excel, or other dependency files."""
     
     filename = (package_file.filename or "").lower()
@@ -2264,59 +2466,50 @@ async def analyze_batch_file(package_file: UploadFile = File(...), ecosystem: st
         "scan_id": f"batch-{int(time.time())}",
         "filename": package_file.filename,
         "ecosystem": ecosystem,
-        "timestamp": datetime.utcnow().isoformat(),
+        "timestamp": datetime.now(UTC).isoformat(),
         "summary": summary,
         "results": sorted(results, key=lambda x: -x["risk_score"]),
     }
     
-    scan_history.append(batch_result)
+    await save_scan_record(attach_scan_owner(batch_result, current_user))
     return batch_result
 
 @app.get("/history")
-def get_history(limit: int = 20):
+async def get_history(limit: int = 20, current_user: Optional[dict] = Depends(get_optional_current_user)):
     """Get recent scan history."""
+    user_id = current_user.get("id") if current_user else None
+    total = await get_scan_collection().count_documents({"userId": user_id} if user_id else {})
     return {
-        "total": len(scan_history),
-        "scans": list(reversed(scan_history))[:limit]
+        "total": total,
+        "scans": await fetch_recent_scans(limit, user_id)
     }
 
 @app.get("/history/{scan_id}")
-def get_scan(scan_id: str):
+async def get_scan(scan_id: str, current_user: Optional[dict] = Depends(get_optional_current_user)):
     """Get a specific scan by id."""
-    scan = find_scan_by_id(scan_id)
+    scan = await find_scan_by_id(scan_id, current_user.get("id") if current_user else None)
     if not scan:
         raise HTTPException(404, "Scan not found")
     return scan
 
 @app.delete("/history/{scan_id}")
-def delete_scan(scan_id: str):
+async def delete_scan(scan_id: str, current_user: Optional[dict] = Depends(get_optional_current_user)):
     """Delete a specific scan by id."""
-    for idx, scan in enumerate(scan_history):
-        if scan.get("scan_id") == scan_id:
-            removed = scan_history.pop(idx)
-            return {"message": "Scan deleted", "scan_id": removed.get("scan_id")}
-    raise HTTPException(404, "Scan not found")
+    deleted = await delete_scan_by_id(scan_id, current_user.get("id") if current_user else None)
+    if not deleted:
+        raise HTTPException(404, "Scan not found")
+    return {"message": "Scan deleted", "scan_id": scan_id}
 
 @app.get("/stats")
-def get_stats():
+async def get_stats(current_user: Optional[dict] = Depends(get_optional_current_user)):
     """Dashboard stats."""
-    total = len(scan_history)
-    malicious = sum(1 for s in scan_history if s.get("risk", {}).get("label") == "MALICIOUS")
-    suspicious = sum(1 for s in scan_history if s.get("risk", {}).get("label") == "SUSPICIOUS")
-    
-    return {
-        "total_scans": total,
-        "malicious_found": malicious,
-        "suspicious_found": suspicious,
-        "benign": total - malicious - suspicious,
-        "threat_rate": round((malicious / total * 100) if total > 0 else 0, 1),
-    }
+    return await compute_scan_stats(current_user.get("id") if current_user else None)
 
 @app.delete("/history")
-def clear_history():
+async def clear_history(current_user: Optional[dict] = Depends(get_optional_current_user)):
     """Clear scan history."""
-    scan_history.clear()
-    return {"message": "History cleared"}
+    deleted = await clear_scan_history(current_user.get("id") if current_user else None)
+    return {"message": "History cleared", "deleted": deleted}
 
 if __name__ == "__main__":
     import uvicorn

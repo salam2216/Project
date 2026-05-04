@@ -1,7 +1,9 @@
 // API endpoint configuration
-const rawApiBase = import.meta.env.VITE_API_URL;
+const rawApiBase = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000';
 
 export const API = rawApiBase.replace(/\/+$/, '');
+const ACCESS_TOKEN_KEY = 'accessToken';
+const LEGACY_TOKEN_KEY = 'token';
 
 interface ApiRequestOptions {
 	fallbackPaths?: string[];
@@ -46,11 +48,25 @@ function buildCandidatePaths(path: string, fallbackPaths: string[] = []) {
 export async function apiFetch(path: string, init?: RequestInit, options?: ApiRequestOptions) {
 	const errors: string[] = [];
 	const candidates = buildCandidatePaths(path, options?.fallbackPaths);
+	const token = (() => {
+		try {
+			return localStorage.getItem(ACCESS_TOKEN_KEY) ?? localStorage.getItem(LEGACY_TOKEN_KEY);
+		} catch {
+			return null;
+		}
+	})();
+	const headers = new Headers(init?.headers || {});
+	if (token && !headers.has('Authorization')) {
+		headers.set('Authorization', `Bearer ${token}`);
+	}
 
 	for (const candidatePath of candidates) {
 		const url = buildApiUrl(candidatePath);
 		try {
-			const response = await fetch(url, init);
+			const response = await fetch(url, {
+				...init,
+				headers,
+			});
 			if (response.ok) {
 				return response;
 			}

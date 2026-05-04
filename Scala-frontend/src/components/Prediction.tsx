@@ -1,6 +1,6 @@
 import React, { useEffect, useMemo, useState } from 'react';
 import { SlidersHorizontal, FileText, Upload, Sparkles, ShieldAlert, CheckCircle2 } from 'lucide-react';
-import { API as DEFAULT_API, apiGetJson, apiPostForm, apiPostJson } from '../api';
+import { apiGetJson, apiPostForm, apiPostJson } from '../api';
 
 interface PredictionResultItem {
   index: number;
@@ -245,14 +245,6 @@ const Prediction: React.FC = () => {
         <div>
           <h1 className="page-title">ML <span>Prediction</span></h1>
           <p className="page-subtitle">Run risk prediction using manual features, CSV row, or CSV file upload.</p>
-        </div>
-        <div className="card-sm" style={{ minWidth: 230 }}>
-          <div style={{ fontSize: 11, letterSpacing: 1, textTransform: 'uppercase', color: 'var(--text-dim)', marginBottom: 6 }}>
-            Active Endpoint
-          </div>
-          <div style={{ fontFamily: 'var(--font-mono)', color: 'var(--text-bright)', fontSize: 12, wordBreak: 'break-all' }}>
-            {DEFAULT_API}
-          </div>
         </div>
       </div>
 
